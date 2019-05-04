@@ -24,15 +24,21 @@ class InputEncoder(nn.Module):
             self.apply(init_params)
 
     def forward(self, x):
-        return torch.sum(self.embedding(x) * self.f, dim=1)
+        dim = 0
+        if len(x.size()) > 1:
+            dim = 1
+
+        return torch.sum(self.embedding(x) * self.f, dim=dim)
 
 
 class OutputModule(nn.Module):
-    def __init__(self, embedding_dim, vocab_dim, activation=nn.PReLU(), init_params=None):
+    def __init__(self, block_dim, n_blocks, vocab_dim, activation=nn.PReLU(), init_params=None):
         super(OutputModule, self).__init__()
-        self.block_dim = embedding_dim
-        self.H = nn.Linear(embedding_dim, embedding_dim)
-        self.R = nn.Linear(embedding_dim, vocab_dim)
+        self.block_dim = block_dim
+        self.n_blocks = n_blocks
+        self.vocab_dim = vocab_dim
+        self.H = nn.Linear(block_dim, block_dim)
+        self.R = nn.Linear(block_dim, vocab_dim)
         self.activation = activation
         self.softmax = nn.LogSoftmax(dim=0)
 
@@ -40,62 +46,55 @@ class OutputModule(nn.Module):
             self.apply(init_params)
 
     def forward(self, q, h):
-        y = []
-        h = torch.split(h, self.block_dim)
+        u = torch.zeros(self.block_dim)
+        for j in range(self.n_blocks):
+            low = j * self.block_dim
+            high = j * self.block_dim + self.block_dim
 
-        for qi in q:
-            u = torch.zeros(h[0].size())
-            for hj in h:
-                u += self.softmax(qi * hj) * hj
+            u += self.softmax(q * h[low:high]) * h[low:high]
 
-            yi = self.R(self.activation(qi + self.H(u)))
-
-            y.append(yi)
-
-        return torch.stack(y)
+        return self.R(self.activation(q + self.H(u)))
 
 
 class DynamicMemoryCell(nn.Module):
-    def __init__(self, n_blocks, block_dim, keys, activation=nn.PReLU(), init_params=None):
+    def __init__(self, n_blocks, block_dim, activation=nn.PReLU(), init_params=None):
         super(DynamicMemoryCell, self).__init__()
         self.n_blocks = n_blocks
         self.block_dim = block_dim
-        self.keys = keys
         self.activation = activation
 
-        self.U = nn.Parameter(torch.ones((block_dim, block_dim)))
-        self.V = nn.Parameter(torch.ones((block_dim, block_dim)))
-        self.W = nn.Parameter(torch.ones((block_dim, block_dim)))
-        self.bias = nn.Parameter(torch.ones(block_dim))
+        self.U = nn.Parameter(torch.randn((block_dim, block_dim)))
+        self.V = nn.Parameter(torch.randn((block_dim, block_dim)))
+        self.W = nn.Parameter(torch.randn((block_dim, block_dim)))
+        self.bias = nn.Parameter(torch.ones(block_dim)) * 0.01
         self.g_activation = nn.Sigmoid()
 
         if init_params:
             self.apply(init_params)
 
-    def forward(self, s, h):
+    def forward(self, s, h, keys):
         h_new = []
-
-        h = torch.split(h, self.block_dim)
-
-        for j, hj in enumerate(h):
-            w = self.keys[j]
+        for j in range(self.n_blocks):
+            low = j * self.block_dim
+            high = j * self.block_dim + self.block_dim
+            w = keys[j]
 
             # gating function
-            g = self.g_activation((s * hj).sum() + (s * w).sum())
+            g = self.g_activation(torch.dot(s, h[low:high]) + torch.dot(s, w))
 
             # candidate for memory update
-            h_squiggle = self.activation(torch.matmul(self.U, hj)
+            h_squiggle = self.activation(torch.matmul(self.U, h[low:high])
                                          + torch.matmul(self.V, w)
                                          + torch.matmul(self.W, s)
                                          + self.bias)
 
             # update hidden state j
-            hj_new = hj + g * h_squiggle
+            h_ = h[low:high] + g * h_squiggle
 
             # normalization (forgetting mechanism)
-            hj_new = hj_new / torch.norm(hj_new)
+            h_ = h_ / torch.norm(h_)
 
-            h_new.append(hj_new)
+            h_new.append(h_)
 
         return torch.cat(h_new)
 
@@ -123,35 +122,25 @@ class EntNet(nn.Module):
         else:
             self.embedding = nn.Embedding(self.vocab_dim, embedding_dim)
 
-        keys = self.embedding(torch.LongTensor([key for key in range(self.vocab_dim - n_blocks, self.vocab_dim)]))
+        self.key_idx = torch.LongTensor([key for key in range(self.vocab_dim - n_blocks, self.vocab_dim)])
         self.input_encoder = InputEncoder(self.embedding, embedding_dim, max_story_len, init_params=init_params)
         self.query_encoder = InputEncoder(self.embedding, embedding_dim, max_query_len, init_params=init_params)
-        self.memory = DynamicMemoryCell(n_blocks, embedding_dim, keys, init_params=init_params)
-        self.output_module = OutputModule(embedding_dim, self.vocab_dim, init_params=init_params)
+        self.memory = DynamicMemoryCell(n_blocks, embedding_dim, init_params=init_params)
+        self.output_module = OutputModule(embedding_dim, n_blocks, self.vocab.num_words, init_params=init_params)
 
         if init_params:
             self.apply(init_params)
 
-    def forward(self, inputs, query, h0=None):
-        x = self.input_encoder(inputs)
-        q = self.query_encoder(query)
+    def forward(self, inputs, query):
+        y = torch.zeros((len(inputs), self.vocab.num_words))
+        keys = self.embedding(self.key_idx)
+        for i, story in enumerate(inputs):
+            h = torch.flatten(keys)  # torch.zeros(self.n_blocks * self.block_dim)
+            q = self.query_encoder(query[i])
+            for sent in story:
+                s = self.input_encoder(sent)
+                h = self.memory(s, h, keys)
 
-        h = None
-        if h0:
-            h = h0
-        else:
-            h = nn.Parameter(torch.rand(self.n_blocks * self.block_dim))
+            y[i] = self.output_module(q, h)
 
-        for s in x:
-            h = self.memory(s, h)
-
-        y = self.output_module(q, h)
-
-        return y, h
-
-
-def loss_function(outputs, labels):
-    loss = torch.nn.NLLLoss()
-
-    return loss(outputs, labels)
-
+        return y

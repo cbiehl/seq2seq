@@ -4,12 +4,10 @@
 import re
 import nltk
 import numpy as np
-import torch
 from functools import reduce
 from tensorflow.python.keras.utils.data_utils import get_file
 from graphviz import Digraph
 import torch
-from torch.autograd import Variable
 
 
 class Voc(object):
@@ -20,6 +18,7 @@ class Voc(object):
         self.PAD_token_idx = 0
         self.SOS_token_idx = 1
         self.EOS_token_idx = 2
+        self.num_util_tokens = 3
         self.name = name
         self.language = language
         self.trimmed = False
@@ -70,6 +69,9 @@ class Voc(object):
         for word in keep_words:
             self.add_word(word)
 
+
+def flatten(seqofseq):
+    return reduce(lambda x, y: x + y, seqofseq)
 
 # Lowercase, trim, and remove non-letter characters
 def normalize_string(s):
@@ -161,7 +163,7 @@ def parse_stories(lines, only_supporting=False):
     return data
 
 
-def get_stories(f, only_supporting=False, max_length=None):
+def get_stories(f, only_supporting=False, max_length=None, flatten_stories=False):
     """
     Given a file name, read the file,
     retrieve the stories,
@@ -176,44 +178,69 @@ def get_stories(f, only_supporting=False, max_length=None):
     :return:
     """
     data = parse_stories(f.readlines(), only_supporting=only_supporting)
-    flatten = lambda data: reduce(lambda x, y: x + y, data)
-    data = [(flatten(story), q, answer) for story, q, answer in data
-            if not max_length or len(flatten(story)) < max_length]
+    if flatten_stories:
+        data = [(flatten(story), q, answer) for story, q, answer in data
+                if not max_length or len(flatten(story)) < max_length]
+    else:
+        data = [(story, q, answer) for story, q, answer in data
+                if not max_length or len(flatten(story)) < max_length]
 
     return data
 
 
-def zero_pad(seq, voc, maxlen=None):
+def zero_pad(seq, voc, maxlen=None, flat=True):
     # get the length of each sentence
-    lengths = [len(s) for s in seq]
+    lengths = None
+    if flat:
+        lengths = [len(s) for s in seq]
+    else:
+        lengths = [len(s) for story in seq for s in story]
+
     pad_token = voc.PAD_token_idx
 
     if maxlen is None:
         maxlen = max(lengths)
 
-    batch_size = len(seq)
-
     # create an empty matrix with padding tokens
-    padded_x = np.ones((batch_size, maxlen)) * pad_token  #TODO: torch.ones ?
+    padded_x = None
+    if flat:
+        batch_size = len(seq)
+        padded_x = np.ones((batch_size, maxlen)) * pad_token
 
-    # copy over the actual sequences
-    for i, x_len in enumerate(lengths):
-        sequence = seq[i]
-        padded_x[i, 0:x_len] = sequence[:x_len]
+        # copy over the actual sequences
+        for i, x_len in enumerate(lengths):
+            sequence = seq[i]
+            padded_x[i, 0:x_len] = sequence[:x_len]
+
+    else:
+        padded_x = []
+
+        k = 0
+        for i, s in enumerate(seq):
+            padded_sent = np.ones((len(seq[i]), maxlen)) * pad_token
+            for j, sent in enumerate(s):
+                sent_len = lengths[k]
+                padded_sent[j, 0:sent_len] = seq[i][j][:sent_len]
+                k += 1
+
+            padded_x.append(padded_sent)
 
     return padded_x
 
 
-def vectorize_stories(data, voc, story_maxlen, query_maxlen):
+def vectorize_stories(data, voc, story_maxlen, query_maxlen, stories_are_flat=True):
     inputs, queries, answers = [], [], []
 
     for story, query, answer in data:
-        inputs.append([voc.word2index[w] for w in story])
+        inputs.append([[voc.word2index[w] for w in sent] for sent in story])
         queries.append([voc.word2index[w] for w in query])
         answers.append(voc.word2index[answer])
 
-    return (zero_pad(inputs, voc, maxlen=story_maxlen),
-            zero_pad(queries, voc, maxlen=query_maxlen),
+    padded_inputs = zero_pad(inputs, voc, maxlen=story_maxlen, flat=stories_are_flat)
+    padded_queries = zero_pad(queries, voc, maxlen=query_maxlen, flat=True)
+
+    return (padded_inputs,
+            padded_queries,
             np.array(answers))
 
 
